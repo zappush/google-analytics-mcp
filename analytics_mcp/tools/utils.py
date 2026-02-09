@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Common utilities used by the MCP server."""
+"""Common utilities used by the MCP server.
 
-from typing import Any, Dict
+Modified to support per-request OAuth tokens for multi-user deployments.
+"""
+
+from contextvars import ContextVar
+from typing import Any, Dict, Optional
 
 from google.analytics import admin_v1beta, data_v1beta, admin_v1alpha
 from google.api_core.gapic_v1.client_info import ClientInfo
+from google.oauth2.credentials import Credentials
 from importlib import metadata
 import google.auth
 import proto
@@ -44,9 +49,52 @@ _READ_ONLY_ANALYTICS_SCOPE = (
     "https://www.googleapis.com/auth/analytics.readonly"
 )
 
+# Context variable to hold the current request's access token
+# This allows per-request credentials in a multi-user environment
+_current_access_token: ContextVar[Optional[str]] = ContextVar(
+    "current_access_token", default=None
+)
+
+
+def set_access_token(token: str) -> None:
+    """Sets the access token for the current request context.
+
+    Call this at the start of each request to set the user's OAuth token.
+    """
+    _current_access_token.set(token)
+
+
+def get_access_token() -> Optional[str]:
+    """Gets the access token for the current request context."""
+    return _current_access_token.get()
+
+
+def clear_access_token() -> None:
+    """Clears the access token for the current request context."""
+    _current_access_token.set(None)
+
 
 def _create_credentials() -> google.auth.credentials.Credentials:
-    """Returns Application Default Credentials with read-only scope."""
+    """Returns credentials for API calls.
+
+    If an access token is set in the current context (via set_access_token),
+    uses OAuth2 credentials with that token. Otherwise, falls back to
+    Application Default Credentials.
+
+    This allows the server to work in both:
+    - Multi-user mode: Each request provides its own OAuth token
+    - Single-user mode: Uses ADC (original behavior)
+    """
+    token = get_access_token()
+
+    if token:
+        # Use the provided OAuth token
+        return Credentials(
+            token=token,
+            scopes=[_READ_ONLY_ANALYTICS_SCOPE]
+        )
+
+    # Fall back to Application Default Credentials
     credentials, _ = google.auth.default(scopes=[_READ_ONLY_ANALYTICS_SCOPE])
     return credentials
 
@@ -54,7 +102,7 @@ def _create_credentials() -> google.auth.credentials.Credentials:
 def create_admin_api_client() -> admin_v1beta.AnalyticsAdminServiceAsyncClient:
     """Returns a properly configured Google Analytics Admin API async client.
 
-    Uses Application Default Credentials with read-only scope.
+    Uses OAuth token from context if available, otherwise ADC.
     """
     return admin_v1beta.AnalyticsAdminServiceAsyncClient(
         client_info=_CLIENT_INFO, credentials=_create_credentials()
@@ -64,7 +112,7 @@ def create_admin_api_client() -> admin_v1beta.AnalyticsAdminServiceAsyncClient:
 def create_data_api_client() -> data_v1beta.BetaAnalyticsDataAsyncClient:
     """Returns a properly configured Google Analytics Data API async client.
 
-    Uses Application Default Credentials with read-only scope.
+    Uses OAuth token from context if available, otherwise ADC.
     """
     return data_v1beta.BetaAnalyticsDataAsyncClient(
         client_info=_CLIENT_INFO, credentials=_create_credentials()
@@ -75,7 +123,8 @@ def create_admin_alpha_api_client() -> (
     admin_v1alpha.AnalyticsAdminServiceAsyncClient
 ):
     """Returns a properly configured Google Analytics Admin API (alpha) async client.
-    Uses Application Default Credentials with read-only scope.
+
+    Uses OAuth token from context if available, otherwise ADC.
     """
     return admin_v1alpha.AnalyticsAdminServiceAsyncClient(
         client_info=_CLIENT_INFO, credentials=_create_credentials()
